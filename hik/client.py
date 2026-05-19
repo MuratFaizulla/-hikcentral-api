@@ -64,7 +64,7 @@ class HikClient:
             data = json.loads(path.read_text(encoding="utf-8"))
             return {
                 k: data[k]
-                for k in ("username", "password", "base_url")
+                for k in ("username", "base_url")
                 if data.get(k)
             }
         except Exception:
@@ -82,11 +82,10 @@ class HikClient:
             "aes_key_hex": self.aes_key_hex,
             "token_key_num": self._tkn,
         }
-        for k in ("username", "password"):
-            if creds and creds.get(k):
-                payload[k] = creds[k]
-            elif existing.get(k):
-                payload[k] = existing[k]
+        if creds and creds.get("username"):
+            payload["username"] = creds["username"]
+        elif existing.get("username"):
+            payload["username"] = existing["username"]
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     # ---------------------- low-level: token + request ----------------------
