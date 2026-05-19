@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import background  # noqa: F401 — starts session-watcher, event-poller, cache-prewarm threads
-from routers import devices, events, persons, raw, records, session, stats
+from routers import devices, events, persons, raw, records, session, stats, webhooks
 
 tags_metadata = [
     {"name": "Session",  "description": "Логин и состояние сессии."},
@@ -14,6 +14,7 @@ tags_metadata = [
     {"name": "Stats",    "description": "Сводная статистика для дашборда."},
     {"name": "Devices",  "description": "Устройства, зоны, точки доступа и системная информация."},
     {"name": "Raw",      "description": "Сырой проксирующий вызов ISAPI."},
+    {"name": "Webhooks", "description": "Подписка на события о новых проходах через HTTP POST."},
 ]
 
 app = FastAPI(
@@ -33,7 +34,7 @@ app.add_middleware(
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-for _router in [session.router, persons.router, records.router, stats.router, devices.router, events.router, raw.router]:
+for _router in [session.router, persons.router, records.router, stats.router, devices.router, events.router, raw.router, webhooks.router]:
     app.include_router(_router)
 
 

@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import state
 from core import _extract_records, _hik_call, _is_session_expired, _now_iso, _try_relogin, decrypt_in_place, get_client, load_or_init_client
 from cache import _get_all_persons, _get_today_records, _update_gid_dept_cache
+from routers.webhooks import fire_webhooks, has_active_webhooks
 
 
 # ── SSE ────────────────────────────────────────────────────────────────────
@@ -96,8 +97,9 @@ def _event_poller_loop() -> None:
         time.sleep(POLL_INTERVAL)
 
         with state._sse_clients_lock:
-            if not state._sse_clients:
-                continue
+            has_sse = bool(state._sse_clients)
+        if not has_sse and not has_active_webhooks():
+            continue
         if state._client is None:
             continue
 
@@ -143,6 +145,7 @@ def _event_poller_loop() -> None:
             state._presence_cache["data"] = None
             state._today_records_cache["data"] = None
             _sse_broadcast(new_records)
+            fire_webhooks(new_records)
 
         except Exception:
             pass

@@ -1,6 +1,7 @@
 # Secrets
 .env
 session.json
+webhooks.json
 
 # Python
 __pycache__/

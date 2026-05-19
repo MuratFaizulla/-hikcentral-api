@@ -15,6 +15,7 @@ FastAPI-бэкенд, проксирующий HikCentral Professional v2.6 че
 - [Кэши и производительность](#кэши-и-производительность)
 - [Фоновые потоки](#фоновые-потоки)
 - [Шифрование](#шифрование)
+- [Webhooks](#webhooks)
 
 ---
 
@@ -22,11 +23,12 @@ FastAPI-бэкенд, проксирующий HikCentral Professional v2.6 че
 
 ```
 backend/
-├── app.py                  # точка входа (~44 строки): FastAPI app + регистрация роутеров
+├── app.py                  # точка входа: FastAPI app + регистрация роутеров
 ├── state.py                # глобальное мутабельное состояние (клиент, локи, кэши)
 ├── core.py                 # _hik_call, decrypt_in_place, _resolve_person_query, get_client
 ├── cache.py                # кэширующие аксессоры с double-checked locking
 ├── background.py           # фоновые потоки (session-watcher, event-poller, cache-prewarm)
+├── settings.py             # pydantic-settings: читает .env
 │
 ├── routers/                # FastAPI роутеры — по одному на домен
 │   ├── __init__.py
@@ -36,6 +38,7 @@ backend/
 │   ├── stats.py            # /api/stats/today, /daily, /presence, /late
 │   ├── devices.py          # /api/elements, /areas, /sites, /devices/*, /video/*
 │   ├── events.py           # /api/events/stream  (SSE)
+│   ├── webhooks.py         # /api/webhooks  (CRUD + fire-and-forget доставка)
 │   └── raw.py              # /api/raw  (сырой прокси ISAPI)
 │
 ├── hik/                    # пакет: вся логика работы с HikCentral
@@ -45,7 +48,8 @@ backend/
 │   ├── autologin.py        # Playwright headless-логин (захват SID + AES ключа)
 │   └── direct_login.py     # прямой HTTP-логин (RSA + SHA256 деривация ключа)
 │
-├── session.json            # сохранённая сессия (SID + ключ + creds), gitignored
+├── session.json            # сохранённая сессия (SID + ключ + username), gitignored
+├── webhooks.json           # зарегистрированные webhook URL-ы, gitignored
 └── requirements.txt
 ```
 
@@ -74,12 +78,15 @@ from hik import HikClient, decrypt_field
 ### Docker (рекомендуется)
 
 ```bash
-# из корня репозитория
+# из корня репозитория — поднимает backend + frontend
 docker compose up --build
 ```
 
-Бэкенд будет доступен на `http://localhost:8000`.  
-Swagger UI: `http://localhost:8000/docs`
+| Сервис | URL |
+|---|---|
+| Frontend (nginx) | `http://localhost:80` |
+| Backend (FastAPI) | `http://localhost:8000` |
+| Swagger UI | `http://localhost:8000/docs` |
 
 ### Локально
 
@@ -205,7 +212,7 @@ KeepAlive → ErrorCode = 0 ?
 
 | Метод | Путь | Описание |
 |---|---|---|
-| `GET` | `/api/records` | Проходы. `?fetch_all=true` — все страницы; `?person_name=ИИН` — поиск |
+| `GET` | `/api/records` | Проходы. `?fetch_all=true` — все страницы (параллельная загрузка); `?person_name=ИИН` — поиск |
 | `GET` | `/api/records/export.xlsx` | Выгрузка в Excel (те же фильтры) |
 | `GET` | `/api/access-points` | Список точек доступа (с fallback из записей за 30 дней) |
 | `GET` | `/api/events/stream` | SSE-поток: новые проходы в реальном времени (polling 10s) |
@@ -263,6 +270,29 @@ KeepAlive → ErrorCode = 0 ?
 { "path": "ISAPI/Bumblebee/Platform/V0/KeepLive", "mt": "GET", "body": null }
 ```
 
+### Webhooks
+
+| Метод | Путь | Описание |
+|---|---|---|
+| `POST` | `/api/webhooks` | Зарегистрировать URL для получения уведомлений |
+| `GET` | `/api/webhooks` | Список зарегистрированных webhooks |
+| `DELETE` | `/api/webhooks/{id}` | Удалить webhook |
+| `POST` | `/api/webhooks/{id}/test` | Отправить тестовый запрос на URL |
+
+При каждом новом проходе бэкенд делает `POST` на все зарегистрированные URL:
+
+```json
+{
+  "event": "new_passes",
+  "timestamp": "2026-05-19T10:00:00",
+  "records": [{ "Person": {}, "DeviceTime": "...", "ElementName": "..." }]
+}
+```
+
+Если при регистрации указан `secret` — каждый запрос содержит заголовок  
+`X-Hik-Signature: sha256=<hmac-sha256>` для проверки подлинности на принимающей стороне.  
+При неудаче доставки — 1 автоматический повтор через 2 секунды.
+
 ---
 
 ## Кэши и производительность
@@ -290,7 +320,7 @@ KeepAlive → ErrorCode = 0 ?
 
 **`session-watcher`** — каждые 120s вызывает `KeepAlive`. При `ErrorCode` истёкшей сессии запускает авто-релогин через `hik_direct_login`. При ошибке повторяет каждые 60s.
 
-**`event-poller`** — каждые 10s запрашивает новые проходы (только если есть SSE-клиенты). Дедуплицирует по ключу `DeviceTime|ElementID|PersonID`. При новых записях инвалидирует кэши presence и today_records, рассылает SSE.
+**`event-poller`** — каждые 10s запрашивает новые проходы (если есть SSE-клиенты или зарегистрированы webhooks). Дедуплицирует по ключу `DeviceTime|ElementID|PersonID`. При новых записях инвалидирует кэши presence и today_records, рассылает SSE и вызывает `fire_webhooks()`.
 
 **`cache-prewarm`** — однократно через 3s после старта загружает всех людей и записи за сегодня.
 
@@ -399,7 +429,7 @@ RC4Drop768(key, ciphertext)   ← RC4, но первые 192×4=768 байт key
 
 **`build_client_from_browser_capture()`** — конструктор для ручного логина. Если `encrypted_aes_b64` начинается с `__hex__:` — это уже готовый ключ (от `direct_login`), иначе запускает RC4Drop расшифровку.
 
-**`save_session` / `from_session_file`** — сохраняет `{sid, aes_key_hex, token_key_num, username, password}` в `session.json`. При перезапуске контейнера сессия восстанавливается без нового логина.
+**`save_session` / `from_session_file`** — сохраняет `{sid, aes_key_hex, token_key_num, username}` в `session.json`. Пароль намеренно **не сохраняется** — берётся из `.env` при авто-релогине. При перезапуске контейнера сессия восстанавливается без нового логина.
 
 ---
 
@@ -505,3 +535,34 @@ HikCentral шифрует чувствительные поля (ФИО, ИИН,
 Все ответы бэкенда содержат уже расшифрованные значения — `decrypt_in_place()` в `core.py` рекурсивно обходит JSON и расшифровывает нужные поля на лету.
 
 Каждый HTTP-запрос к HikCentral подписывается заголовком `AppendInfo` — токен строится из счётчика (`_tkn`) и AES-ключа. Счётчик монотонно растёт и защищает от replay-атак.
+
+---
+
+## Webhooks
+
+Бэкенд поддерживает push-уведомления: при каждом новом проходе отправляет `POST` на зарегистрированные URL.
+
+**Конфигурация хранится** в `webhooks.json` (gitignored, персистентна между перезапусками).
+
+**Поток доставки:**
+
+```
+event-poller обнаружил новые проходы
+       │
+       ├──► SSE broadcast → все открытые вкладки браузера
+       │
+       └──► fire_webhooks() → daemon-поток
+                   │
+                   ├──► POST https://bot.example.com/notify  (таймаут 5s)
+                   │         ├── OK  → готово
+                   │         └── fail → повтор через 2s
+                   │
+                   └──► POST https://other-service.com/hik  (параллельно)
+```
+
+**HMAC-подпись** — если при регистрации указан `secret`, каждый запрос содержит:
+```
+X-Hik-Signature: sha256=<hmac-sha256(secret, body)>
+```
+
+Принимающая сторона может проверить подлинность запроса, пересчитав HMAC.
