@@ -16,12 +16,20 @@ FastAPI-бэкенд, проксирующий HikCentral Professional v2.6 че
 - [Фоновые потоки](#фоновые-потоки)
 - [Шифрование](#шифрование)
 - [Webhooks](#webhooks)
+- [Логирование](#логирование)
+- [PWA — установка на телефон](#pwa--установка-на-телефон)
+- [CI/CD — GitHub Actions](#cicd--github-actions)
+- [Внешний доступ — Cloudflare Tunnel](#внешний-доступ--cloudflare-tunnel)
 
 ---
 
 ## Архитектура
 
 ```
+.github/
+└── workflows/
+    └── deploy.yml          # CI/CD: автодеплой при git push в main
+
 backend/
 ├── app.py                  # точка входа: FastAPI app + регистрация роутеров
 ├── state.py                # глобальное мутабельное состояние (клиент, локи, кэши)
@@ -82,11 +90,20 @@ from hik import HikClient, decrypt_field
 docker compose up --build
 ```
 
-| Сервис | URL |
-|---|---|
-| Frontend (nginx) | `http://localhost:80` |
-| Backend (FastAPI) | `http://localhost:8000` |
-| Swagger UI | `http://localhost:8000/docs` |
+| Сервис | URL | Описание |
+|---|---|---|
+| Frontend (nginx) | `http://localhost:80` | React SPA |
+| Backend (FastAPI) | `http://localhost:8000` | REST API |
+| Swagger UI | `http://localhost:8000/docs` | Интерактивная документация API |
+| Cloudflare Tunnel | выдаётся Cloudflare | Внешний HTTPS-доступ (опционально) |
+
+Cloudflare Tunnel запускается отдельно:
+
+```bash
+docker compose up -d cloudflared          # запустить туннель
+docker logs hik-cloudflared               # посмотреть выданный URL
+docker compose stop cloudflared           # остановить туннель
+```
 
 ### Локально
 
@@ -109,6 +126,7 @@ uvicorn app:app --reload --port 8000
 | `HIK_HOSTNAME` | `10.25.1.30` | hostname для RC4Drop пасфразы |
 | `HIK_USERNAME` | — | логин для авто-релогина |
 | `HIK_PASSWORD` | — | пароль для авто-релогина |
+| `TUNNEL_TOKEN` | — | токен Cloudflare Named Tunnel (опционально) |
 
 Если `session.json` существует — переменные `HIK_SID` / `HIK_ENCRYPTED_AES_KEY` игнорируются.
 
@@ -566,3 +584,145 @@ X-Hik-Signature: sha256=<hmac-sha256(secret, body)>
 ```
 
 Принимающая сторона может проверить подлинность запроса, пересчитав HMAC.
+
+---
+
+## Логирование
+
+Все модули пишут структурированные логи через стандартный `logging`. Формат:
+
+```
+2026-05-19 10:00:00 [INFO]    background: Starting tunnel ...
+2026-05-19 10:00:05 [WARNING] cache: gid-dept cache refresh failed
+2026-05-19 10:00:10 [ERROR]   background: event-poller error
+Traceback (most recent call last): ...
+```
+
+Уровни по модулям:
+
+| Модуль | Что логируется |
+|---|---|
+| `background` | запуск потоков, ошибки event-poller, сбои prewarm |
+| `cache` | ошибки обновления gid-dept кэша |
+| `core` | отладка резолвера поисковых запросов |
+
+Посмотреть логи в Docker:
+
+```bash
+docker logs hik-backend          # backend
+docker logs hik-cloudflared      # cloudflare tunnel
+docker logs -f hik-backend       # в реальном времени
+```
+
+---
+
+## PWA — установка на телефон
+
+Фронтенд настроен как Progressive Web App — браузер предложит установить сайт как приложение на телефон.
+
+**Что даёт PWA:**
+- Иконка на экране телефона (как нативное приложение)
+- Открывается без адресной строки, в полноэкранном режиме
+- Работает в тёмной теме (`background: #0a0c12`)
+- Сервис-воркер кэширует статику (быстрый старт)
+
+**Где появляется кнопка установки:**
+
+| Платформа | Где |
+|---|---|
+| Chrome (Desktop) | Иконка в адресной строке справа (монитор со стрелкой) |
+| Chrome (Android) | Баннер снизу «Добавить на главный экран» |
+| Safari (iOS) | Кнопка «Поделиться» → «На экран «Домой»» |
+
+> **Важно:** PWA-установка через браузер работает только по `https://`. По `http://` — только на `localhost`.  
+> Для установки на телефонах из школьной сети нужен [Cloudflare Tunnel](#внешний-доступ--cloudflare-tunnel) или HTTPS-сертификат.
+
+**Обновление иконок** (если изменится логотип):
+
+```bash
+cd frontend-react
+npm run gen-icons    # пересоздаёт public/icons/icon-192.png и icon-512.png
+npm run build
+```
+
+---
+
+## CI/CD — GitHub Actions
+
+При каждом `git push` в ветку `main` GitHub автоматически деплоит проект на сервер через SSH.
+
+**Файл:** `.github/workflows/deploy.yml`
+
+```
+git push origin main
+       │
+       ▼
+GitHub Actions runner
+       │
+       ▼
+SSH → сервер
+       │
+       ├── git pull origin main
+       ├── docker compose up --build -d
+       └── docker image prune -f
+```
+
+**Настройка — добавить Secrets в репозиторий:**
+
+`GitHub → Settings → Secrets and variables → Actions → New repository secret`
+
+| Secret | Значение |
+|---|---|
+| `SERVER_HOST` | IP или hostname сервера |
+| `SERVER_USER` | SSH-пользователь (например `ubuntu`) |
+| `SSH_PRIVATE_KEY` | Приватный SSH-ключ (содержимое `~/.ssh/id_rsa`) |
+| `DEPLOY_PATH` | Путь к проекту на сервере (например `/opt/hikcentral`) |
+
+**Как создать SSH-ключ для деплоя:**
+
+```bash
+ssh-keygen -t ed25519 -C "github-deploy" -f ~/.ssh/deploy_key
+# публичный ключ добавить на сервер:
+cat ~/.ssh/deploy_key.pub >> ~/.ssh/authorized_keys
+# приватный ключ вставить в секрет SSH_PRIVATE_KEY:
+cat ~/.ssh/deploy_key
+```
+
+---
+
+## Внешний доступ — Cloudflare Tunnel
+
+Позволяет открыть фронтенд наружу (HTTPS) без публичного IP и без открытия портов.
+
+### Quick Tunnel (временный URL, без аккаунта)
+
+```bash
+docker compose up -d cloudflared      # запустить
+docker logs hik-cloudflared           # найти URL вида https://xxxx.trycloudflare.com
+docker compose stop cloudflared       # остановить
+```
+
+> URL меняется при каждом перезапуске. Подходит для быстрой проверки, не для постоянного использования.
+
+### Named Tunnel (постоянный URL, нужен домен)
+
+1. Создать аккаунт на [cloudflare.com](https://cloudflare.com)
+2. Зайти на [one.dash.cloudflare.com](https://one.dash.cloudflare.com) → **Networks → Tunnels → Create tunnel**
+3. Скопировать токен из команды `docker run ... --token <TOKEN>`
+4. Вставить токен в `backend/.env`:
+   ```
+   TUNNEL_TOKEN=eyJhIjoi...
+   ```
+5. Изменить команду в `docker-compose.yml`:
+   ```yaml
+   cloudflared:
+     command: tunnel --no-autoupdate run
+     env_file: [./backend/.env]
+   ```
+6. В Cloudflare Dashboard → туннель → **Public Hostname** → добавить:
+   - **Service:** `http://frontend:80`
+7. Перезапустить: `docker compose up -d cloudflared`
+
+### Предупреждение о безопасности
+
+При открытии наружу API остаётся без авторизации — любой с URL получит доступ к данным учеников. Перед публичным деплоем необходимо добавить авторизацию (API-ключ или логин/пароль).

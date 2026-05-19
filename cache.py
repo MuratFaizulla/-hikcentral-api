@@ -1,8 +1,11 @@
 """Кэширующие аксессоры с double-checked locking."""
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 import state
 from core import _hik_call, decrypt_in_place, get_client
@@ -75,7 +78,7 @@ def _ensure_gid_dept_cache() -> None:
                     state._gid_dept_cache[gid] = name
             state._gid_dept_cache_ts = now
     except Exception:
-        pass
+        logger.warning("gid-dept cache refresh failed", exc_info=True)
 
 
 def _update_gid_dept_cache(records: list[dict]) -> None:

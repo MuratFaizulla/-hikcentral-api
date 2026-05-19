@@ -1,8 +1,15 @@
 """FastAPI прокси над HikCentral Professional."""
 from __future__ import annotations
 
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
 import background  # noqa: F401 — starts session-watcher, event-poller, cache-prewarm threads
 from routers import devices, events, persons, raw, records, session, stats, webhooks

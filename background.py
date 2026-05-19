@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+
+logger = logging.getLogger(__name__)
 
 import state
 from core import _extract_records, _hik_call, _is_session_expired, _now_iso, _try_relogin, decrypt_in_place, get_client, load_or_init_client
@@ -24,7 +27,7 @@ def _sse_broadcast(records: list[dict]) -> None:
         try:
             state._sse_loop.call_soon_threadsafe(q.put_nowait, payload)
         except Exception:
-            pass
+            logger.debug("sse broadcast to client failed", exc_info=True)
 
 
 def _record_dedup_key(r: dict) -> str:
@@ -44,7 +47,7 @@ def _do_check_and_renew() -> None:
         try:
             state._client = load_or_init_client()
         except Exception:
-            pass
+            logger.warning("failed to load session on startup", exc_info=True)
 
     if state._client is None:
         state._watch_status["status"] = "renewing"
@@ -148,7 +151,7 @@ def _event_poller_loop() -> None:
             fire_webhooks(new_records)
 
         except Exception:
-            pass
+            logger.exception("event-poller error")
 
 
 # ── Cache prewarm ──────────────────────────────────────────────────────────
@@ -158,11 +161,11 @@ def _prewarm_caches() -> None:
     try:
         _get_all_persons(get_client())
     except Exception:
-        pass
+        logger.warning("prewarm persons failed", exc_info=True)
     try:
         _get_today_records()
     except Exception:
-        pass
+        logger.warning("prewarm today-records failed", exc_info=True)
 
 
 # ── Start threads ──────────────────────────────────────────────────────────

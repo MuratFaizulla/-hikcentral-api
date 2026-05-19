@@ -1,9 +1,12 @@
 """Клиент HikCentral, авторизация, шифрование, общие утилиты."""
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 import state
 from hik.client import HikClient, build_client_from_browser_capture
@@ -156,5 +159,5 @@ def _resolve_person_query(
         if 1 < len(matched) <= 20:
             return None, [p["ID"] for p in matched if p.get("ID")], None
     except Exception:
-        pass
+        logger.debug("person query resolve failed", exc_info=True)
     return None, [], person_name
