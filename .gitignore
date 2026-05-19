@@ -1,0 +1,15 @@
+# Secrets
+.env
+session.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Editor
+.idea/
+.vscode/
+*.swp

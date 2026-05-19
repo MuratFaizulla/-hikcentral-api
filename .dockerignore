@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+test_*.py
+verify_*.py
+find_key_formula.py
