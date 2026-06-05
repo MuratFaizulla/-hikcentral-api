@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -155,6 +156,84 @@ def list_records(
     return {"page": page, "page_size": page_size, "total": total, "records": records}
 
 
+def _pass_direction(element_name: str, card_reader_name: str) -> str:
+    name = (element_name or card_reader_name or "").lower()
+    if "-in-" in name or "_in_" in name or re.search(r'\bin\b', name):
+        return "in"
+    if "-out-" in name or "_out_" in name or re.search(r'\bout\b', name):
+        return "out"
+    return "unknown"
+
+
+def _group_by_person_py(records: list[dict]) -> list[dict]:
+    """Python-аналог groupByPerson из фронтенда."""
+    seen: dict[str, dict] = {}
+    for r in records:
+        pid = (r.get("Person") or {}).get("ID")
+        key = f"p{pid}" if pid else f"c{r.get('CardNumber') or id(r)}"
+        b = (r.get("Person") or {}).get("BaseInfo") or {}
+        name = b.get("GivenName") or b.get("FullName") or (f"ID {pid}" if pid else "—")
+        dir_ = _pass_direction(r.get("ElementName", ""), r.get("CardReaderName", ""))
+        dt = r.get("DeviceTime") or ""
+        if key not in seen:
+            seen[key] = {
+                "person_id": pid,
+                "name": name,
+                "iin": b.get("FamilyName") or "",
+                "code": b.get("PersonCode") or "",
+                "dept": b.get("FullPath") or "",
+                "first_entry": dt,
+                "last_pass": dt,
+                "last_element": r.get("ElementName") or r.get("CardReaderName") or "",
+                "zone": dir_,
+                "pass_count": 1,
+            }
+        else:
+            g = seen[key]
+            g["pass_count"] += 1
+            if dt:
+                if not g["first_entry"] or dt < g["first_entry"]:
+                    g["first_entry"] = dt
+                if not g["last_pass"] or dt > g["last_pass"]:
+                    g["last_pass"] = dt
+                    g["last_element"] = r.get("ElementName") or r.get("CardReaderName") or ""
+                    g["zone"] = dir_
+    return sorted(seen.values(), key=lambda x: x.get("last_pass", ""), reverse=True)
+
+
+def _fetch_photo_safe(client, *, person_id=None, snap_url=None) -> bytes | None:
+    try:
+        if snap_url:
+            data = client.get_picture(snap_url)
+            if data and len(data) > 500:
+                return data
+        if person_id:
+            data = client.get_photo(person_id)
+            if data and len(data) > 500:
+                return data
+    except Exception:
+        pass
+    return None
+
+
+def _make_xl_image(photo_bytes: bytes, w: int = 100, h: int = 130):
+    try:
+        from openpyxl.drawing.image import Image as _XLImg
+        from PIL import Image as _PIL
+        import io as _io
+        pil = _PIL.open(_io.BytesIO(photo_bytes)).convert("RGB")
+        pil.thumbnail((w, h), _PIL.LANCZOS)
+        buf = _io.BytesIO()
+        pil.save(buf, format="JPEG", quality=90)
+        buf.seek(0)
+        xl = _XLImg(buf)
+        xl.width = pil.width
+        xl.height = pil.height
+        return xl
+    except Exception:
+        return None
+
+
 @router.get("/api/records/export.xlsx", tags=["Records"])
 def export_records_xlsx(
     start_time: Optional[str] = Query(None),
@@ -162,8 +241,10 @@ def export_records_xlsx(
     person_id: Optional[int] = Query(None),
     person_name: Optional[str] = Query(None),
     element_ids: Optional[str] = Query(None),
+    with_photos: bool = Query(False, description="Вставить фото в таблицу"),
+    grouped: bool = Query(False, description="Группировать по персонам (режим 'день')"),
 ):
-    """Выгрузить проходы в Excel (.xlsx). Параметры те же что у /api/records."""
+    """Выгрузить проходы в Excel. grouped=true → сводка по людям; with_photos=true → вставить фото."""
     import io
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
@@ -174,59 +255,165 @@ def export_records_xlsx(
         end_time = _now.isoformat(timespec="seconds")
 
     _pid, _multi_pids_export, _pname = _resolve_person_query(person_name, person_id)
-    if _multi_pids_export:
-        _pid = _multi_pids_export[0]
-        _pname = None
-
     _eids = element_ids or ""
+
     try:
-        all_records, _ = _fetch_all_pages(start_time, end_time, _eids, _pid, _pname)
+        if _multi_pids_export:
+            all_records: list = []
+            seen_keys: set = set()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(_multi_pids_export))) as ex:
+                futs = {ex.submit(_fetch_all_pages, start_time, end_time, _eids, pid, None): pid
+                        for pid in _multi_pids_export}
+                for fut in concurrent.futures.as_completed(futs):
+                    batch, _ = fut.result()
+                    for r in batch:
+                        k = _record_dedup_key(r)
+                        if k not in seen_keys:
+                            seen_keys.add(k)
+                            all_records.append(r)
+        else:
+            all_records, _ = _fetch_all_pages(start_time, end_time, _eids, _pid, _pname)
     except Exception as e:
         raise HTTPException(500, str(e))
 
     decrypt_in_place(all_records, get_client().aes_key_hex)
+    client = get_client()
 
     wb = Workbook()
     ws = wb.active
     ws.title = "Проходы"
 
-    header_fill = PatternFill("solid", fgColor="1E2235")
-    header_font = Font(bold=True, color="C8CCDE", size=11)
-    headers = ["#", "Имя", "ИИН", "Код", "Отдел / Класс", "Время", "Точка доступа", "Считыватель", "Результат"]
-    col_widths = [5, 32, 16, 12, 30, 22, 22, 20, 12]
+    HDR_FILL = PatternFill("solid", fgColor="1E2235")
+    HDR_FONT = Font(bold=True, color="C8CCDE", size=11)
+    CENTER = Alignment(horizontal="center", vertical="center")
+    MIDDLE = Alignment(vertical="center")
+    PHOTO_W = 160
+    PHOTO_H = 200
+    ROW_H = 155  # pt ≈ 207px at 96dpi
 
-    for ci, (h, w) in enumerate(zip(headers, col_widths), 1):
-        cell = ws.cell(row=1, column=ci, value=h)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
-        ws.column_dimensions[cell.column_letter].width = w
-
-    ws.freeze_panes = "A2"
     auth_map = {1: "Разрешён", 0: "Отказ"}
+    zone_map = {"in": "В школе", "out": "Вне школы", "unknown": "—"}
 
-    for ri, r in enumerate(all_records, 1):
-        b = (r.get("Person") or {}).get("BaseInfo") or {}
-        given = b.get("GivenName") or b.get("FullName") or ""
-        iin   = b.get("FamilyName") or ""
-        code  = b.get("PersonCode") or ""
-        dept  = b.get("FullPath") or ""
-        pid   = (r.get("Person") or {}).get("ID")
-        name  = given or (f"ID {pid}" if pid else "—")
-        dt_raw = r.get("DeviceTime") or ""
+    def _fmt_dt(s: str | None) -> str:
+        if not s:
+            return "—"
         try:
-            dt_str = datetime.fromisoformat(dt_raw).strftime("%d.%m.%Y %H:%M:%S") if dt_raw else "—"
+            return datetime.fromisoformat(s).strftime("%d.%m.%Y %H:%M:%S")
         except Exception:
-            dt_str = dt_raw
-        result = auth_map.get(r.get("SwipeAuthResult"), "—")
-        row_data = [
-            ri, name, iin, code, dept, dt_str,
-            r.get("ElementName") or "—",
-            r.get("CardReaderName") or "—",
-            result,
-        ]
-        for ci, val in enumerate(row_data, 1):
-            ws.cell(row=ri + 1, column=ci, value=val)
+            return s
+
+    def _fmt_time(s: str | None) -> str:
+        if not s:
+            return "—"
+        try:
+            return datetime.fromisoformat(s).strftime("%H:%M:%S")
+        except Exception:
+            return s
+
+    def _dept_short(full_path: str) -> str:
+        parts = [p.strip() for p in full_path.split(">") if p.strip()]
+        return parts[-1] if parts else full_path or "—"
+
+    def _write_headers(headers: list[str], widths: list[int]) -> None:
+        for ci, (h, w) in enumerate(zip(headers, widths), 1):
+            cell = ws.cell(row=1, column=ci, value=h)
+            cell.font = HDR_FONT
+            cell.fill = HDR_FILL
+            cell.alignment = CENTER
+            ws.column_dimensions[cell.column_letter].width = w
+        ws.freeze_panes = "A2"
+        ws.row_dimensions[1].height = 22
+
+    if grouped:
+        groups = _group_by_person_py(all_records)
+
+        # Параллельно тянем профильные фото
+        photos: dict[int, bytes | None] = {}
+        if with_photos:
+            pids = [g["person_id"] for g in groups if g.get("person_id")]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+                futs2 = {ex.submit(_fetch_photo_safe, client, person_id=pid): pid for pid in pids}
+                for fut in concurrent.futures.as_completed(futs2):
+                    photos[futs2[fut]] = fut.result()
+
+        hdrs = ["#"]
+        wdts = [5]
+        if with_photos:
+            hdrs.append("Фото"); wdts.append(25)
+        hdrs += ["Имя", "ИИН", "Код", "Отдел / Класс", "Пришёл", "Последний проход", "Зона", "Проходов"]
+        wdts += [32, 16, 12, 30, 12, 22, 14, 10]
+        _write_headers(hdrs, wdts)
+
+        for ri, g in enumerate(groups, 1):
+            row = ri + 1
+            ws.cell(row=row, column=1, value=ri).alignment = CENTER
+            data_col = 2
+            if with_photos:
+                pid = g.get("person_id")
+                if pid and photos.get(pid):
+                    xl = _make_xl_image(photos[pid], PHOTO_W, PHOTO_H)
+                    if xl:
+                        ws.add_image(xl, ws.cell(row=row, column=2).coordinate)
+                data_col = 3
+            vals = [
+                g["name"], g["iin"] or "—", g["code"] or "—",
+                _dept_short(g["dept"]),
+                _fmt_time(g["first_entry"]), _fmt_dt(g["last_pass"]),
+                zone_map.get(g["zone"], "—"), g["pass_count"],
+            ]
+            for ci, v in enumerate(vals, data_col):
+                ws.cell(row=row, column=ci, value=v).alignment = MIDDLE
+            if with_photos:
+                ws.row_dimensions[row].height = ROW_H
+
+    else:
+        # Период: одна строка = одна запись
+        photos_period: dict[int, bytes | None] = {}
+        if with_photos:
+            tasks = {idx: (r.get("SnapPicUrl"), (r.get("Person") or {}).get("ID"))
+                     for idx, r in enumerate(all_records)}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+                futs2 = {ex.submit(_fetch_photo_safe, client, snap_url=snap, person_id=pid): idx
+                         for idx, (snap, pid) in tasks.items()}
+                for fut in concurrent.futures.as_completed(futs2):
+                    photos_period[futs2[fut]] = fut.result()
+
+        hdrs = ["#"]
+        wdts = [5]
+        if with_photos:
+            hdrs.append("Фото"); wdts.append(25)
+        hdrs += ["Имя", "ИИН", "Код", "Отдел / Класс", "Время", "Точка доступа", "Считыватель", "Результат"]
+        wdts += [32, 16, 12, 30, 22, 22, 20, 12]
+        _write_headers(hdrs, wdts)
+
+        for idx, r in enumerate(all_records):
+            row = idx + 2
+            ri = idx + 1
+            b = (r.get("Person") or {}).get("BaseInfo") or {}
+            pid = (r.get("Person") or {}).get("ID")
+            name = b.get("GivenName") or b.get("FullName") or (f"ID {pid}" if pid else "—")
+            ws.cell(row=row, column=1, value=ri).alignment = CENTER
+            data_col = 2
+            if with_photos:
+                pb = photos_period.get(idx)
+                if pb:
+                    xl = _make_xl_image(pb, PHOTO_W, PHOTO_H)
+                    if xl:
+                        ws.add_image(xl, ws.cell(row=row, column=2).coordinate)
+                data_col = 3
+                ws.row_dimensions[row].height = ROW_H
+            vals = [
+                name,
+                b.get("FamilyName") or "—",
+                b.get("PersonCode") or "—",
+                _dept_short(b.get("FullPath") or ""),
+                _fmt_dt(r.get("DeviceTime")),
+                r.get("ElementName") or "—",
+                r.get("CardReaderName") or "—",
+                auth_map.get(r.get("SwipeAuthResult"), "—"),
+            ]
+            for ci, v in enumerate(vals, data_col):
+                ws.cell(row=row, column=ci, value=v).alignment = MIDDLE
 
     buf = io.BytesIO()
     wb.save(buf)
